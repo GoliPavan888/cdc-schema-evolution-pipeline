@@ -1,0 +1,144 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cdc-mysql
+    command: ["--defaults-file=/etc/mysql/conf.d/my.cnf"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: cdc-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "cub zk-ready localhost:2181 30"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: cdc-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "cub kafka-ready -b localhost:9092 1 30"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  connect:
+    image: debezium/connect:2.6.2.Final
+    container_name: cdc-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_PLUGIN_PATH: /kafka/connect,/debezium-connector-mysql
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  processor:
+    build:
+      context: ./processor
+    container_name: cdc-processor
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      connect:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      CONNECT_REST_URL: ${CONNECT_REST_URL}
+      TOPIC_PREFIX: ${TOPIC_PREFIX}
+      TABLE_INCLUDE_LIST: ${TABLE_INCLUDE_LIST}
+      DEBEZIUM_DB_USER: ${DEBEZIUM_DB_USER}
+      DEBEZIUM_DB_PASSWORD: ${DEBEZIUM_DB_PASSWORD}
+      PROCESSOR_GROUP_ID: ${PROCESSOR_GROUP_ID}
+      PROCESSOR_BATCH_SIZE: ${PROCESSOR_BATCH_SIZE}
+      PROCESSOR_FLUSH_RECORDS: ${PROCESSOR_FLUSH_RECORDS}
+      PROCESSOR_FLUSH_SECONDS: ${PROCESSOR_FLUSH_SECONDS}
+      DATA_LAKE_ROOT: ${DATA_LAKE_ROOT}
+      STATE_DB_PATH: ${STATE_DB_PATH}
+      LINEAGE_OUTPUT_PATH: ${LINEAGE_OUTPUT_PATH}
+      AUTO_REGISTER_CONNECTOR: ${AUTO_REGISTER_CONNECTOR}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    volumes:
+      - ./data_lake:/app/data_lake
+      - ./state:/app/state
+      - ./output:/app/output
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os,sqlite3; p=os.environ.get('STATE_DB_PATH','/app/state/schemas.db'); os.makedirs('/app/state',exist_ok=True); sqlite3.connect(p).close(); os.makedirs('/app/data_lake',exist_ok=True); print('ok')\""
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mysql_data:
