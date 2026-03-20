@@ -1,0 +1,18 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db-journal
+mysql_data/
+.data/
+
+# Keep directories, ignore generated content
+!data_lake/.gitkeep
+!state/.gitkeep
+!output/.gitkeep
+!output/lineage_report.json
+
+data_lake/**
+state/**
+output/**
